@@ -29,3 +29,49 @@ _syscall3 (int, sched_setaffinity, pid_t, pid, unsigned int, len, unsigned long 
 _syscall3 (int, sched_getaffinity, pid_t, pid, unsigned int, len, unsigned long *, user_mask_ptr)
 
 #endif
+
+#include <linux/kernel.h>
+#include <linux/unistd.h>
+#include <linux/types.h>
+#include <time.h>
+
+/* XXX use the proper syscall numbers */
+#ifdef __x86_64__
+#define __NR_sched_setscheduler_ex	303
+#define __NR_sched_getparam_ex		305
+#endif
+
+#ifdef __i386__
+#define __NR_sched_setscheduler_ex	341
+#define __NR_sched_getparam_ex		343
+#endif
+
+#ifdef __arm__
+#define __NR_sched_setscheduler_ex	370
+#define __NR_sched_getparam_ex		372
+#endif
+
+#define SF_SIG_RORUN	2
+#define SF_SIG_DMISS	4
+#define SF_BWRECL_DL    8
+#define SF_BWRECL_RT    16
+#define SF_BWRECL_NR    32
+
+struct sched_param_ex {
+	int sched_priority;
+	struct timespec sched_runtime;
+	struct timespec sched_deadline;
+	struct timespec sched_period;
+	unsigned int sched_flags;
+	struct timespec curr_runtime;
+	struct timespec used_runtime;
+	struct timespec curr_deadline;
+};
+
+#define sched_setscheduler_ex(pid, policy, len, param) \
+	syscall(__NR_sched_setscheduler_ex, pid, policy, len, param)
+
+#define sched_getparam_ex(pid, len, param) \
+	syscall(__NR_sched_getparam_ex, pid, len, param)
+
+
