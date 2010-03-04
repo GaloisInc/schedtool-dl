@@ -1,6 +1,7 @@
 # go on and adjust here if you don't like those flags
 CFLAGS=-Os -fomit-frame-pointer -s -pipe
-#CFLAGS=-Wall -Os -fomit-frame-pointer -s -pipe -DDEBUG
+#CFLAGS=-Wall -g -fomit-frame-pointer -s -pipe -DDEBUG
+LDFLAGS=-lm
 CC=gcc
 # likewise, if you want to change the destination prefix
 DESTDIR=

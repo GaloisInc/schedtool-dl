@@ -45,7 +45,9 @@
 #include <sched.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <math.h>
 
+#include "syscall_magic.h"
 #include "error.h"
 #include "util.h"
 
@@ -74,10 +76,11 @@
 #define SCHED_BATCH	3
 #define SCHED_ISO	4
 #define SCHED_IDLEPRIO	5
+#define SCHED_DEADLINE	6
 
 /* for loops */
 #define SCHED_MIN SCHED_NORMAL
-#define SCHED_MAX SCHED_IDLEPRIO
+#define SCHED_MAX SCHED_DEADLINE
 
 #define CHECK_RANGE_POLICY(p) (p <= SCHED_MAX && p >= SCHED_MIN)
 #define CHECK_RANGE_NICE(n) (n <= 20 && n >= -20)
@@ -96,6 +99,7 @@ char *TAB[] = {
 	"B: SCHED_BATCH",
 	"I: SCHED_ISO",
 	"D: SCHED_IDLEPRIO",
+	"E: SCHED_DEADLINE",
 	0
 };
 
@@ -106,6 +110,12 @@ struct engine_s {
 	int policy;
 	int prio;
         int nice;
+
+	long rtime;
+	long dline;
+	long priod;
+
+	unsigned flags;
 	cpu_set_t aff_mask;
 
 	/* # of args when going in PID-mode */
@@ -115,11 +125,15 @@ struct engine_s {
 
 
 int engine(struct engine_s *e);
-int set_process(pid_t pid, int policy, int prio);
+int set_process(pid_t pid, int policy, struct sched_param_ex *p);
 static inline int val_to_char(int v);
 static char * cpuset_to_str(cpu_set_t *mask, char *str);
 static inline int char_to_val(int c);
 static int str_to_cpuset(cpu_set_t *mask, const char* str);
+struct timespec us_to_tspec(long us);
+long tspec_to_us(struct timespec *ts);
+int parse_time(long *rtime, long *dline, long *priod, char *arg);
+int parse_flags(unsigned *f, char *arg);
 int parse_affinity(cpu_set_t *, char *arg);
 int set_affinity(pid_t pid, cpu_set_t *mask);
 int set_niceness(pid_t pid, int nice);
@@ -143,7 +157,8 @@ int main(int ac, char **dc)
 	 mode: MODE_NOTHING, no options set
 	 */
 	int policy=-1, nice=10, prio=0, mode=MODE_NOTHING;
-
+	long rtime=0, dline=0, priod=0;
+	unsigned flags = 0;
 	/*
 	 aff_mask: zero it out
 	 */
@@ -158,7 +173,7 @@ int main(int ac, char **dc)
 		return(0);
 	}
 
-	while((c=getopt(ac, dc, "+NFRBID012345M:a:p:n:ervh")) != -1) {
+	while((c=getopt(ac, dc, "+NFRBIDE012345M:a:p:t:f:n:ervh")) != -1) {
 
 		switch(c) {
 		case '0':
@@ -191,6 +206,11 @@ int main(int ac, char **dc)
 			policy=SCHED_IDLEPRIO;
                         mode |= MODE_SETPOLICY;
 			break;
+		case '6':
+		case 'E':
+			policy=SCHED_DEADLINE;
+			mode |= MODE_SETPOLICY;
+			break;
 		case 'M':
 			/* manual setting */
 			policy=atoi(optarg);
@@ -209,6 +229,12 @@ int main(int ac, char **dc)
 			break;
 		case 'p':
 			prio=atoi(optarg);
+			break;
+		case 't':
+			parse_time(&rtime, &dline, &priod, optarg);
+			break;
+		case 'f':
+			parse_flags(&flags, optarg);
 			break;
 		case 'r':
                         probe_sched_features();
@@ -266,6 +292,11 @@ int main(int ac, char **dc)
 			return(ac-optind);
 		}
 #undef CHECK_RANGE_PRIO
+	} else if (policy == SCHED_DEADLINE) {
+		if (!dline || !rtime) {
+			decode_error("timing parameters are required for policy %s", TAB[policy]);
+			return(ac-optind);
+		}
 	}
 
 	/* no mode -> do querying */
@@ -296,8 +327,14 @@ int main(int ac, char **dc)
 		stuff.mode=mode;
 		stuff.policy=policy;
 		stuff.prio=prio;
-		stuff.aff_mask=aff_mask;
 		stuff.nice=nice;
+
+		stuff.rtime=rtime;
+		stuff.dline=dline;
+		stuff.priod=priod;
+
+		stuff.flags=flags;
+		stuff.aff_mask=aff_mask;
 
                 /* we have this much real args/PIDs to process */
 		stuff.n=ac-optind;
@@ -355,13 +392,21 @@ int engine(struct engine_s *e)
 
 	exec_mode_special:
 		if(mode_set(e->mode, MODE_SETPOLICY)) {
+			struct sched_param_ex p;
+
+			p.sched_priority= e->prio;
+			p.sched_runtime=us_to_tspec(e->rtime);
+			p.sched_deadline=us_to_tspec(e->dline);
+			p.sched_period=us_to_tspec(e->priod);
+			p.sched_flags=e->flags;
+
 			/*
 			 accumulate possible errors
 			 the return value of main will indicate
 			 how much set-calls went wrong
                          set_process returns -1 upon failure
 			 */
-			tmpret=set_process(pid,e->policy,e->prio);
+			tmpret=set_process(pid,e->policy,&p);
 			ret += tmpret;
 
                         /* don't proceed as something went wrong already */
@@ -417,18 +462,15 @@ int engine(struct engine_s *e)
 }
 
 
-int set_process(pid_t pid, int policy, int prio)
+int set_process(pid_t pid, int policy, struct sched_param_ex *p)
 {
-	struct sched_param p;
 	int ret;
 
 	char *msg1="could not set PID %d to %s";
 	char *msg2="could not set PID %d to raw policy #%d";
 
-	p.sched_priority=prio;
-
 	/* anything other than 0 indicates error */
-	if((ret=sched_setscheduler(pid, policy, &p))) {
+	if((ret=sched_setscheduler_ex(pid, policy, sizeof(*p), p))) {
 
                 /* la la pointer mismatch .. lala */
 		decode_error((CHECK_RANGE_POLICY(policy) ? msg1 : msg2),
@@ -440,6 +482,64 @@ int set_process(pid_t pid, int policy, int prio)
 	return(0);
 }
 
+struct timespec us_to_tspec(long us)
+{
+	struct timespec ts;
+
+	ts.tv_sec = us / 1000000;
+	ts.tv_nsec = (us % 1000000) * 1000;
+
+	return ts;
+}
+
+long tspec_to_us(struct timespec *ts)
+{
+	return round((ts->tv_sec * 1E9 + ts->tv_nsec) / 1000.0);
+}
+
+int parse_time(long *rtime, long *dline, long *priod, char *arg)
+{
+	char *str;
+
+	str=strtok(arg, ":");
+	*rtime=strtol(str, NULL, 10);
+
+	str=strtok(NULL, ":");
+	*dline=strtol(str, NULL, 10);
+
+	str=strtok(NULL, ":");
+	if (str)
+		*priod=strtol(str, NULL, 10);
+	else
+		*priod=*dline;
+
+#ifdef DEBUG
+	printf("tmp_arg: %s -> rtime: %ld dline: %ld priod: %ld\n", arg, *rtime, *dline);
+#endif
+
+	return str == NULL;
+}
+
+int parse_flags(unsigned *f, char *arg)
+{
+	*f = 0;
+	if (strstr(arg, "s"))
+		*f |= SF_SIG_RORUN;
+	if (strstr(arg, "S"))
+		*f |= SF_SIG_DMISS;
+	if (strstr(arg, "D"))
+		*f |= SF_BWRECL_DL;
+	if (strstr(arg, "R"))
+		*f |= SF_BWRECL_RT;
+	if (strstr(arg, "O"))
+		*f |= SF_BWRECL_NR;
+
+#ifdef DEBUG
+	printf("tmp_arg: %s -> flags: %x\n", arg, *f);
+#endif
+
+	return *f;
+}
 
 /*
  the following functions have been taken from taskset of util-linux
@@ -658,7 +758,7 @@ void print_prio_min_max(int policy)
 void print_process(pid_t pid)
 {
 	int policy, nice;
-	struct sched_param p;
+	struct sched_param_ex p;
 	cpu_set_t aff_mask;
 	CPUSET_HEXSTRING(aff_mask_hex);
 
@@ -668,7 +768,7 @@ void print_process(pid_t pid)
 	/* strict error checking not needed - it works or not. */
         errno=0;
 	if( ((policy=sched_getscheduler(pid)) < 0)
-	    || (sched_getparam(pid, &p) < 0)
+	    || (sched_getparam_ex(pid, sizeof(p), &p) < 0)
 	    /* getpriority may successfully return negative values, so errno needs to be checked */
 	    || ((nice=getpriority(PRIO_PROCESS, pid)) && errno)
 	  ) {
@@ -692,6 +792,16 @@ void print_process(pid_t pid)
 			       TAB[policy],
 			       nice
 			      );
+
+			if (policy == SCHED_DEADLINE) {
+				printf(", RUNTIME %Ldus DEADLINE %Ldus FLAGS 0x%04x"
+				       ", CURR. RUNTIME %Ldus USED RUNTIME %Ldus",
+				       tspec_to_us(&p.sched_runtime),
+				       tspec_to_us(&p.sched_deadline),
+				       p.sched_flags,
+				       tspec_to_us(&p.curr_runtime),
+				       tspec_to_us(&p.used_runtime));
+			}
 		}
 
 		/*
@@ -727,6 +837,8 @@ void usage(void)
                "    -B                    for SCHED_BATCH\n" \
                "    -I -p PRIO            for SCHED_ISO\n" \
                "    -D                    for SCHED_IDLEPRIO\n" \
+	       "    -E -t rt:dl[:pr]      for SCHED_DEADLINE   only as root\n" \
+               "       [ -f sSDRO ]\n" \
                "\n" \
                "    -M POLICY             for manual mode; raw number for POLICY\n" \
                "    -p STATIC_PRIORITY    usually 1-99; only for FIFO or RR\n" \
